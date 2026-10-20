@@ -1,5 +1,7 @@
 # ArmDTPlatform
 
-ARM device-tree platform expert.
+ARM device-tree platform expert. Creates platform nubs from the ADT and matches drivers by compatible string.
 
-Maintained as an independent module and included by [UniXNU](https://github.com/UniXNU/UniXNU) at `drivers/ArmDTPlatform`.
+Current state: used by the sheng port for its device tree.
+
+Linked into XNU by `unixnu build kernel`.
