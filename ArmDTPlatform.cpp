@@ -11,13 +11,29 @@
 // The NVRAM proxy is required so the real IODTNVRAM is published before any
 // security initialization. This driver does not fabricate NVRAM or suppress
 // a missing one; absent inputs make configure() fail.
+//
+// Wall clock. As on Apple hardware, an RTC driver (an IORTC subclass) publishes
+// the "IORTC" resource and the platform expert forwards the calendar to it.
+// XNU's BCM2837 configuration does not wait for that resource before it reads
+// the calendar, so the first read waits for it here when the device tree has
+// an arm-io node named "rtc" (boot argument rtc-wait-ms, default 3000).
+// A driver that sets the boolean property "IORTCReadOnly" cannot write its
+// counter (the PMIC RTC of Qualcomm phones). The platform then keeps the wall
+// clock as counter + offset, and the kernel keeps the offset on the Data
+// volume, as Android's time_daemon keeps it under /data/vendor/time:
+// armdt_rtc_restore() takes it once the volume is mounted, and every calendar
+// set hands a changed offset to native_rtc_offset_store().
 
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOLocks.h>
+#include <IOKit/rtc/IORTCController.h>
+#include <libkern/c++/OSBoolean.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSIterator.h>
 #include <pexpert/pexpert.h>
+#include <sys/errno.h>
 
 // Observation counters describe actual published nubs, not started drivers.
 extern "C" {
@@ -28,6 +44,17 @@ volatile uint32_t armdt_platform_bus_count = 0;
 volatile uint32_t armdt_platform_defaults_count = 0;
 volatile uint32_t armdt_platform_nvram_proxy = 0;
 volatile uint32_t armdt_platform_device_count = 0;
+// [0] 1 an RTC node is declared, 2 the IORTC driver was found, 3 it is read-only;
+// [1] calendar reads; [2] offset restores; [3] offsets handed to the store;
+// [4] last store result.
+volatile int32_t armdt_platform_rtc_stats[5] = {};
+// The kernel's offset store on the Data volume (kern_exec.c with the owner
+// Data mount). A static kernel link needs a definition, so this weak one
+// stands in when the kernel has no store.
+__attribute__ ((weak)) int native_rtc_offset_store (int64_t offset)
+{
+  return ENOTSUP;
+}
 }
 
 class ArmDTPlatform : public IODTPlatformExpert {
@@ -36,12 +63,157 @@ public:
   bool configure (IOService *provider) override;
   const char *deleteList (void) override;
   const char *excludeList (void) override;
+  void getUTCTimeOfDay (clock_sec_t *secs, clock_nsec_t *nsecs) override;
+  void setUTCTimeOfDay (clock_sec_t secs, clock_nsec_t nsecs) override;
 private:
   bool hasNVRAMProxy (IOService *provider);
   bool createDeviceNubs (IOService *provider);
 };
 
 OSDefineMetaClassAndStructors (ArmDTPlatform, IODTPlatformExpert)
+
+namespace {
+IORTC *gRTC;
+bool gRTCExpected;
+bool gRTCWaited;
+bool gRTCReadOnly;
+bool gRTCOffsetRestored;
+int64_t gRTCOffset;
+IOLock *gRTCLock;
+
+// The published IORTC driver. Only the first call may wait, and only when the
+// device tree declares an RTC; later calls return what is published.
+IORTC *rtcService (bool wait)
+{
+  if (gRTC != nullptr) {
+    return gRTC;
+  }
+  OSDictionary *matching = IOService::resourceMatching ("IORTC");
+  if (matching == nullptr) {
+    return nullptr;
+  }
+  IOService *resources;
+  if (wait && gRTCExpected && !gRTCWaited) {
+    uint32_t waitMs = 3000;
+    PE_parse_boot_argn ("rtc-wait-ms", &waitMs, sizeof (waitMs));
+    gRTCWaited = true;
+    resources = IOService::waitForMatchingService (matching, (uint64_t)waitMs * 1000000ull);
+  } else {
+    resources = IOService::copyMatchingService (matching);
+  }
+  matching->release ();
+  if (resources == nullptr) {
+    return nullptr;
+  }
+  IORTC *found = OSDynamicCast (IORTC, resources->getProperty ("IORTC"));
+  resources->release ();
+  if (found == nullptr) {
+    return nullptr;
+  }
+  found->retain ();
+  gRTCReadOnly = found->getProperty ("IORTCReadOnly") == kOSBooleanTrue;
+  if (!OSCompareAndSwapPtr (nullptr, found, (void * volatile *)&gRTC)) {
+    found->release ();
+  }
+  armdt_platform_rtc_stats[0] = gRTCReadOnly ? 3 : 2;
+  return gRTC;
+}
+
+// Seconds of the RTC counter itself; 0 when there is no RTC or it cannot be read.
+clock_sec_t rtcCounter (bool wait, clock_nsec_t *nsecs)
+{
+  IORTC *rtc = rtcService (wait);
+  clock_sec_t secs = 0;
+  clock_nsec_t fraction = 0;
+  if (rtc != nullptr) {
+    rtc->getUTCTimeOfDay (&secs, &fraction);
+  }
+  if (nsecs != nullptr) {
+    *nsecs = secs ? fraction : 0;
+  }
+  return secs;
+}
+}
+
+void ArmDTPlatform::getUTCTimeOfDay (clock_sec_t *secs, clock_nsec_t *nsecs)
+{
+  *secs = 0;
+  *nsecs = 0;
+  clock_nsec_t fraction = 0;
+  clock_sec_t counter = rtcCounter (true, &fraction);
+  if (counter == 0) {
+    return;
+  }
+  armdt_platform_rtc_stats[1] = armdt_platform_rtc_stats[1] + 1;
+  int64_t wall = (int64_t)counter;
+  if (gRTCReadOnly && gRTCLock != nullptr) {
+    IOLockLock (gRTCLock);
+    wall += gRTCOffset;
+    IOLockUnlock (gRTCLock);
+  }
+  if (wall > 0) {
+    *secs = (clock_sec_t)wall;
+    *nsecs = fraction;
+  }
+}
+
+void ArmDTPlatform::setUTCTimeOfDay (clock_sec_t secs, clock_nsec_t nsecs)
+{
+  IORTC *rtc = rtcService (false);
+  if (rtc == nullptr || gRTCLock == nullptr) {
+    return;
+  }
+  if (!gRTCReadOnly) {
+    rtc->setUTCTimeOfDay (secs, nsecs);
+    return;
+  }
+  clock_sec_t counter = rtcCounter (false, nullptr);
+  if (counter == 0) {
+    return;
+  }
+  // One-second resolution, as the counter has. A set within a second of the
+  // current offset (the restore below sets the calendar from it) changes
+  // nothing and writes nothing.
+  int64_t offset = (int64_t)secs - (int64_t)counter;
+  IOLockLock (gRTCLock);
+  int64_t delta = offset - gRTCOffset;
+  bool changed = delta > 1 || delta < -1;
+  if (changed) {
+    gRTCOffset = offset;
+  }
+  bool store = changed && gRTCOffsetRestored;
+  IOLockUnlock (gRTCLock);
+  if (store) {
+    armdt_platform_rtc_stats[3] = armdt_platform_rtc_stats[3] + 1;
+    armdt_platform_rtc_stats[4] = native_rtc_offset_store (offset);
+  }
+}
+
+// The kernel calls this once the Data volume is mounted: found says whether it
+// read a saved offset. Returns 1 with the wall clock in *wall when the calendar
+// should be set from the restored offset, 0 when there is nothing to change.
+// From here on every changed offset is handed to native_rtc_offset_store().
+extern "C" int armdt_rtc_restore (int found, int64_t offset, clock_sec_t *wall)
+{
+  *wall = 0;
+  if (gRTCLock == nullptr) {
+    return 0;
+  }
+  clock_sec_t counter = rtcCounter (true, nullptr);
+  IOLockLock (gRTCLock);
+  bool apply = found && gRTCReadOnly && counter != 0;
+  if (apply) {
+    gRTCOffset = offset;
+  }
+  gRTCOffsetRestored = true;
+  IOLockUnlock (gRTCLock);
+  armdt_platform_rtc_stats[2] = armdt_platform_rtc_stats[2] + 1;
+  if (!apply || (int64_t)counter + offset <= 0) {
+    return 0;
+  }
+  *wall = (clock_sec_t)((int64_t)counter + offset);
+  return 1;
+}
 
 // Serialized empty name lists: XNU's processTopLevel() treats a null pointer
 // as "every entry" (remove every child), not as "nothing". An empty list
@@ -107,6 +279,29 @@ bool ArmDTPlatform::createDeviceNubs (IOService *provider)
   iterator->release ();
   armdt_platform_device_count = count;
   return true;
+}
+
+// An RTC is declared by a device-tree node named "rtc" anywhere below arm-io,
+// the generic node name the devicetree specification gives real-time clocks
+// (an SPMI PMIC's RTC sits below its arbiter and PMIC nodes).
+static bool declaresRTC (IOService *provider)
+{
+  IORegistryEntry *bus = provider->childFromPath ("arm-io", gIODTPlane);
+  if (bus == nullptr) {
+    return false;
+  }
+  IORegistryIterator *iterator = IORegistryIterator::iterateOver (bus, gIODTPlane, kIORegistryIterateRecursively);
+  bus->release ();
+  if (iterator == nullptr) {
+    return false;
+  }
+  bool found = false;
+  IORegistryEntry *entry;
+  while (!found && (entry = iterator->getNextObject ()) != nullptr) {
+    found = strcmp (entry->getName (gIODTPlane), "rtc") == 0;
+  }
+  iterator->release ();
+  return found;
 }
 
 static void platformStageReset (void)
@@ -186,6 +381,9 @@ bool ArmDTPlatform::configure (IOService *provider)
   armdt_platform_defaults_count = defaultsCount;
   armdt_platform_nvram_proxy = 1;
   armdt_platform_configured = 1;
+  gRTCLock = IOLockAlloc ();
+  gRTCExpected = declaresRTC (provider);
+  armdt_platform_rtc_stats[0] = gRTCExpected ? 1 : 0;
   // Publish the bus child devices (interrupt controller, VirtIO MMIO, ...)
   // as real IOPlatformDevice nubs. No driver is started here.
   if (!createDeviceNubs (provider)) {
