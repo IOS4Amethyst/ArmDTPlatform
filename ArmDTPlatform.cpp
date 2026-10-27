@@ -65,6 +65,7 @@ public:
   const char *excludeList (void) override;
   void getUTCTimeOfDay (clock_sec_t *secs, clock_nsec_t *nsecs) override;
   void setUTCTimeOfDay (clock_sec_t secs, clock_nsec_t nsecs) override;
+  int haltRestart (unsigned int type) override;
 private:
   bool hasNVRAMProxy (IOService *provider);
   bool createDeviceNubs (IOService *provider);
@@ -313,6 +314,33 @@ static void platformStageReset (void)
   register uint64_t x3 __asm__ ("x3") = 0;
   __asm__ volatile ("smc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x3) : "memory");
   for (;;) { __asm__ volatile ("wfe"); }
+}
+
+// PSCI 0.2 SYSTEM_OFF and SYSTEM_RESET over the SMC conduit platformStageReset uses. Neither returns on success; a
+// return means the call was refused, and the caller gets the generic answer.
+static uint64_t psciSystemCall (uint64_t function)
+{
+  register uint64_t x0 __asm__ ("x0") = function;
+  register uint64_t x1 __asm__ ("x1") = 0;
+  register uint64_t x2 __asm__ ("x2") = 0;
+  register uint64_t x3 __asm__ ("x3") = 0;
+  __asm__ volatile ("smc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x3) : "memory");
+  return x0;
+}
+
+// Power off and restart. Without them the generic platform expert has nothing to call, the CPU idles after the shutdown
+// notifications, and PEHaltRestart's 30 s timer panics ("Halt/Restart Timed Out", asteroids T40d). Panic restarts are left
+// to the generic path, so a panic stays on screen.
+int ArmDTPlatform::haltRestart (unsigned int type)
+{
+  if (type == kPEHaltCPU || type == kPEUPSDelayHaltCPU) {
+    uint64_t result = psciSystemCall (0x84000008);  // SYSTEM_OFF
+    IOLog ("ArmDTPlatform: PSCI SYSTEM_OFF returned %lld\n", (long long) result);
+  } else if (type == kPERestartCPU) {
+    uint64_t result = psciSystemCall (0x84000009);  // SYSTEM_RESET
+    IOLog ("ArmDTPlatform: PSCI SYSTEM_RESET returned %lld\n", (long long) result);
+  }
+  return IODTPlatformExpert::haltRestart (type);
 }
 
 bool ArmDTPlatform::configure (IOService *provider)
