@@ -145,7 +145,7 @@ void ArmDTPlatform::getUTCTimeOfDay (clock_sec_t *secs, clock_nsec_t *nsecs)
   if (counter == 0) {
     return;
   }
-  armdt_platform_rtc_stats[1] = armdt_platform_rtc_stats[1] + 1;
+  armdt_platform_rtc_stats[1] = (int32_t)((uint32_t)armdt_platform_rtc_stats[1] + 1u);
   int64_t wall = (int64_t)counter;
   if (gRTCReadOnly && gRTCLock != nullptr) {
     IOLockLock (gRTCLock);
@@ -190,7 +190,7 @@ void ArmDTPlatform::setUTCTimeOfDay (clock_sec_t secs, clock_nsec_t nsecs)
   bool store = changed && gRTCOffsetRestored;
   IOLockUnlock (gRTCLock);
   if (store) {
-    armdt_platform_rtc_stats[3] = armdt_platform_rtc_stats[3] + 1;
+    armdt_platform_rtc_stats[3] = (int32_t)((uint32_t)armdt_platform_rtc_stats[3] + 1u);
     armdt_platform_rtc_stats[4] = native_rtc_offset_store (offset);
   }
 }
@@ -213,7 +213,7 @@ extern "C" int armdt_rtc_restore (int found, int64_t offset, clock_sec_t *wall)
   }
   gRTCOffsetRestored = true;
   IOLockUnlock (gRTCLock);
-  armdt_platform_rtc_stats[2] = armdt_platform_rtc_stats[2] + 1;
+  armdt_platform_rtc_stats[2] = (int32_t)((uint32_t)armdt_platform_rtc_stats[2] + 1u);
   int64_t wallFromCounter = (int64_t)((uint64_t)counter + (uint64_t)offset);
   if (!apply || wallFromCounter <= 0) {
     return 0;
