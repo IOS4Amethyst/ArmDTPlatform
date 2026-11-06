@@ -149,7 +149,7 @@ void ArmDTPlatform::getUTCTimeOfDay (clock_sec_t *secs, clock_nsec_t *nsecs)
   int64_t wall = (int64_t)counter;
   if (gRTCReadOnly && gRTCLock != nullptr) {
     IOLockLock (gRTCLock);
-    wall += gRTCOffset;
+    wall = (int64_t)((uint64_t)wall + (uint64_t)gRTCOffset);
     IOLockUnlock (gRTCLock);
   }
   if (wall > 0) {
@@ -175,9 +175,14 @@ void ArmDTPlatform::setUTCTimeOfDay (clock_sec_t secs, clock_nsec_t nsecs)
   // One-second resolution, as the counter has. A set within a second of the
   // current offset (the restore below sets the calendar from it) changes
   // nothing and writes nothing.
-  int64_t offset = (int64_t)secs - (int64_t)counter;
+  //
+  // The offset and the delta wrap modulo 2^64 on purpose: a calendar far from
+  // the counter is a legitimate input, not an overflow to report. Each sum is
+  // formed in uint64_t and converted back, so the meaning does not depend on
+  // the sanitizer coverage of the build.
+  int64_t offset = (int64_t)((uint64_t)secs - (uint64_t)counter);
   IOLockLock (gRTCLock);
-  int64_t delta = offset - gRTCOffset;
+  int64_t delta = (int64_t)((uint64_t)offset - (uint64_t)gRTCOffset);
   bool changed = delta > 1 || delta < -1;
   if (changed) {
     gRTCOffset = offset;
@@ -209,10 +214,11 @@ extern "C" int armdt_rtc_restore (int found, int64_t offset, clock_sec_t *wall)
   gRTCOffsetRestored = true;
   IOLockUnlock (gRTCLock);
   armdt_platform_rtc_stats[2] = armdt_platform_rtc_stats[2] + 1;
-  if (!apply || (int64_t)counter + offset <= 0) {
+  int64_t wallFromCounter = (int64_t)((uint64_t)counter + (uint64_t)offset);
+  if (!apply || wallFromCounter <= 0) {
     return 0;
   }
-  *wall = (clock_sec_t)((int64_t)counter + offset);
+  *wall = (clock_sec_t)wallFromCounter;
   return 1;
 }
 
