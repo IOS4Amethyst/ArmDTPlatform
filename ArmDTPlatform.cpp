@@ -243,8 +243,18 @@ bool ArmDTPlatform::hasNVRAMProxy (IOService *provider)
   }
   OSData *bankSize = OSDynamicCast (OSData, chosen->getProperty ("nvram-bank-size"));
   OSData *proxyData = OSDynamicCast (OSData, chosen->getProperty ("nvram-proxy-data"));
-  bool valid = (bankSize != nullptr) && (bankSize->getLength () == sizeof (uint32_t)) &&
-               (proxyData != nullptr) && (proxyData->getLength () != 0);
+  bool proxyValid = (proxyData != nullptr) && (proxyData->getLength () != 0);
+  if (!proxyValid) {
+    // Newer XNU (iOS 27) creates NVRAM before platform matching:
+    // IOPlatformExpertDevice::configureDefaults() -> createNVRAM() starts an
+    // IODTNVRAM in place of /options, and IODTNVRAM::initImageFormat() copies
+    // and then removes /chosen/nvram-proxy-data. The proxy is then already in
+    // use, not absent.
+    IORegistryEntry *options = IORegistryEntry::fromPath ("/options", gIODTPlane);
+    proxyValid = (options != nullptr) && (options->metaCast ("IODTNVRAM") != nullptr);
+    OSSafeReleaseNULL (options);
+  }
+  bool valid = (bankSize != nullptr) && (bankSize->getLength () == sizeof (uint32_t)) && proxyValid;
   chosen->release ();
   return valid;
 }
